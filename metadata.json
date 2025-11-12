@@ -1,0 +1,5 @@
+{
+  "name": "Player Eligibility Tracker-1",
+  "description": "An application to track player eligibility with countdown timers, history logs, and notifications. It helps manage player activity for games by showing when a player is eligible to play again.",
+  "requestFramePermissions": []
+}
