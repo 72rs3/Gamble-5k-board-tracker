@@ -349,10 +349,10 @@ const App: React.FC = () => {
         <p>{confirmationState.message}</p>
       </ConfirmationModal>
       <OverrideModal 
-        isOpen={!!playerToEdit} 
+        isOpen={playerToEdit !== null}
         onClose={() => setPlayerToEdit(null)}
-        player={playerToEdit}
         onSave={handleSaveOverride}
+        player={playerToEdit}
       />
     </div>
   );
