@@ -6,6 +6,20 @@ import Notifications from './components/Notifications';
 import HistoryLog from './components/HistoryLog';
 import { AddPlayerModal, ConfirmationModal, OverrideModal } from './components/Modals';
 import { ELIGIBILITY_HOURS, INACTIVITY_DAYS, getNotificationMessage } from './utils/time';
+import { db } from './firebase';
+import {
+  collection,
+  query,
+  onSnapshot,
+  addDoc,
+  updateDoc,
+  doc,
+  orderBy,
+  limit,
+  writeBatch,
+  getDocs,
+} from 'firebase/firestore';
+
 
 type ConfirmationState = {
   isOpen: boolean;
@@ -15,61 +29,9 @@ type ConfirmationState = {
   confirmButtonClass?: string;
 };
 
-// Helper functions for state serialization/deserialization
-const encodeStateToHash = (state: { players: Player[]; historyLog: HistoryEntry[] }): string => {
-  try {
-    const jsonString = JSON.stringify(state);
-    // Use the trick to handle UTF-8 characters correctly
-    const base64 = btoa(unescape(encodeURIComponent(jsonString)));
-    return base64;
-  } catch (e) {
-    console.error("Failed to encode state:", e);
-    return '';
-  }
-};
-
-const decodeStateFromHash = (hash: string): { players: Player[]; historyLog: HistoryEntry[] } | null => {
-  if (!hash || hash.length < 2) return null;
-  try {
-    const base64 = hash.substring(1); // remove #
-    const jsonString = decodeURIComponent(escape(atob(base64)));
-    const decoded = JSON.parse(jsonString);
-    // Basic validation to ensure it's the expected shape
-    if (Array.isArray(decoded.players) && Array.isArray(decoded.historyLog)) {
-        return decoded;
-    }
-    return null;
-  } catch (e) {
-    console.error("Failed to decode state from hash:", e);
-    return null;
-  }
-};
-
-// Helper to get initial state from URL hash or fallback to localStorage
-const getInitialState = (): { players: Player[]; historyLog: HistoryEntry[] } => {
-    const hashData = decodeStateFromHash(window.location.hash);
-    if (hashData) {
-        return { players: hashData.players, historyLog: hashData.historyLog };
-    }
-
-    try {
-        const savedPlayers = localStorage.getItem('players');
-        const savedHistory = localStorage.getItem('historyLog');
-        const players = savedPlayers ? JSON.parse(savedPlayers) : [];
-        const historyLog = savedHistory ? JSON.parse(savedHistory) : [];
-        return { players, historyLog };
-    } catch (error) {
-        console.error("Failed to parse from localStorage", error);
-        return { players: [], historyLog: [] };
-    }
-};
-
 const App: React.FC = () => {
-  const [initialState] = useState(getInitialState);
-
-  const [players, setPlayers] = useState<Player[]>(initialState.players);
-  const [historyLog, setHistoryLog] = useState<HistoryEntry[]>(initialState.historyLog);
-
+  const [players, setPlayers] = useState<Player[]>([]);
+  const [historyLog, setHistoryLog] = useState<HistoryEntry[]>([]);
   const [searchText, setSearchText] = useState('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('All');
   const [sortOption, setSortOption] = useState<SortOption>('status');
@@ -88,28 +50,62 @@ const App: React.FC = () => {
   const [confirmationState, setConfirmationState] = useState<ConfirmationState>({
     isOpen: false, title: '', message: '', onConfirm: () => {},
   });
-  
-  const updatePlayerStatus = useCallback(() => {
-    const now = new Date();
-    let hasChanged = false;
 
-    const updatedPlayers = players.map(player => {
-      let newStatus = player.status;
-      if (player.status === Status.Eligible && player.eligibilityExpiresAt && now > new Date(player.eligibilityExpiresAt)) {
-        newStatus = Status.NotEligible;
-        hasChanged = true;
-      } else if (player.status === Status.NotEligible && player.eligibilityExpiresAt) {
-        const expiryDate = new Date(player.eligibilityExpiresAt);
-        const inactiveDate = new Date(expiryDate.getTime() + INACTIVITY_DAYS * 24 * 60 * 60 * 1000);
-        if (now > inactiveDate) {
-          newStatus = Status.Inactive;
-          hasChanged = true;
-        }
-      }
-      return newStatus !== player.status ? { ...player, status: newStatus } : player;
+  useEffect(() => {
+    const playersCollection = collection(db, 'players');
+    const unsubscribePlayers = onSnapshot(playersCollection, (snapshot) => {
+        const playersData = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id })) as Player[];
+        setPlayers(playersData);
     });
 
-    if (hasChanged) setPlayers(updatedPlayers);
+    const historyCollection = collection(db, 'historyLog');
+    const historyQuery = query(historyCollection, orderBy('timestamp', 'desc'), limit(100));
+    const unsubscribeHistory = onSnapshot(historyQuery, (snapshot) => {
+        const historyData = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id })) as HistoryEntry[];
+        setHistoryLog(historyData);
+    });
+
+    return () => {
+        unsubscribePlayers();
+        unsubscribeHistory();
+    };
+  }, []);
+  
+  const updatePlayerStatus = useCallback(async () => {
+    const now = new Date();
+    const batch = writeBatch(db);
+    let hasChanges = false;
+    
+    players.forEach(player => {
+        let newStatus = player.status;
+        let shouldUpdate = false;
+
+        if (player.status === Status.Eligible && player.eligibilityExpiresAt && now > new Date(player.eligibilityExpiresAt)) {
+            newStatus = Status.NotEligible;
+            shouldUpdate = true;
+        } else if (player.status === Status.NotEligible && player.eligibilityExpiresAt) {
+            const expiryDate = new Date(player.eligibilityExpiresAt);
+            const inactiveDate = new Date(expiryDate.getTime() + INACTIVITY_DAYS * 24 * 60 * 60 * 1000);
+            if (now > inactiveDate) {
+                newStatus = Status.Inactive;
+                shouldUpdate = true;
+            }
+        }
+
+        if (shouldUpdate) {
+            const playerDocRef = doc(db, 'players', player.id);
+            batch.update(playerDocRef, { status: newStatus });
+            hasChanges = true;
+        }
+    });
+
+    if (hasChanges) {
+        try {
+            await batch.commit();
+        } catch (error) {
+            console.error("Error auto-updating player statuses: ", error);
+        }
+    }
   }, [players]);
 
   const generateNotifications = useCallback(() => {
@@ -155,45 +151,23 @@ const App: React.FC = () => {
 
   useEffect(() => {
     try {
-      // Persist user-specific settings to localStorage only
       localStorage.setItem('showNotifications', JSON.stringify(showNotifications));
     } catch (error) {
       console.error("Failed to save notification preference to localStorage", error);
     }
   }, [showNotifications]);
 
-  useEffect(() => {
-    try {
-      // Persist shared state to localStorage AND URL hash
-      const stateToSave = { players, historyLog };
-      localStorage.setItem('players', JSON.stringify(players));
-      localStorage.setItem('historyLog', JSON.stringify(historyLog));
-
-      const newHash = encodeStateToHash(stateToSave);
-      const currentHash = window.location.hash.substring(1);
-
-      if (players.length > 0 || historyLog.length > 0) {
-        if (newHash && newHash !== currentHash) {
-          window.history.replaceState(null, '', '#' + newHash);
-        }
-      } else if (currentHash) {
-        // Clear hash if there's no data
-        window.history.replaceState(null, '', window.location.pathname + window.location.search);
-      }
-    } catch (error) {
-      console.error("Failed to save state to localStorage or URL", error);
-    }
-  }, [players, historyLog]);
-
-
-  const addHistoryEntry = (playerName: string, action: string) => {
-    const newEntry: HistoryEntry = {
-      id: crypto.randomUUID(),
+  const addHistoryEntry = async (playerName: string, action: string) => {
+    const newEntry: Omit<HistoryEntry, 'id'> = {
       playerName,
       action,
       timestamp: new Date().toISOString(),
     };
-    setHistoryLog(prev => [newEntry, ...prev].slice(0, 100)); // Keep last 100 entries
+    try {
+        await addDoc(collection(db, 'historyLog'), newEntry);
+    } catch (error) {
+        console.error("Error adding history entry: ", error);
+    }
   };
 
   const handleMarkAsPlayed = (playerId: string) => {
@@ -205,60 +179,81 @@ const App: React.FC = () => {
       title: 'Confirm Action',
       message: `Mark ${player.name} as played? This will reset their eligibility timer.`,
       confirmButtonClass: 'bg-sky-600 hover:bg-sky-500',
-      onConfirm: () => {
-        let playerName = '';
-        const updatedPlayers = players.map(p => {
-          if (p.id === playerId) {
-            playerName = p.name;
-            const now = new Date();
-            const expiryDate = new Date(now.getTime() + ELIGIBILITY_HOURS * 60 * 60 * 1000);
-            return {
-              ...p,
-              lastPlayed: now.toISOString(),
-              eligibilityExpiresAt: expiryDate.toISOString(),
-              status: Status.Eligible,
-            };
-          }
-          return p;
-        });
-        setPlayers(updatedPlayers);
-        if(playerName) addHistoryEntry(playerName, 'marked as played');
-        setConfirmationState({ ...confirmationState, isOpen: false });
+      onConfirm: async () => {
+        const now = new Date();
+        const expiryDate = new Date(now.getTime() + ELIGIBILITY_HOURS * 60 * 60 * 1000);
+        const playerDocRef = doc(db, 'players', playerId);
+        
+        try {
+            await updateDoc(playerDocRef, {
+                lastPlayed: now.toISOString(),
+                eligibilityExpiresAt: expiryDate.toISOString(),
+                status: Status.Eligible,
+            });
+            await addHistoryEntry(player.name, 'marked as played');
+            setConfirmationState({ ...confirmationState, isOpen: false });
+        } catch (error) {
+            console.error("Error updating player:", error);
+        }
       },
     });
   };
 
-  const handleAddPlayer = (name: string) => {
+  const handleAddPlayer = async (name: string) => {
     const trimmedName = name.trim();
     if (players.some(p => p.name.toLowerCase() === trimmedName.toLowerCase())) {
       setAddPlayerError('Player with this name already exists.');
       return;
     }
 
-    const newPlayer: Player = {
-      id: crypto.randomUUID(), name: trimmedName, lastPlayed: null, eligibilityExpiresAt: null, status: Status.NotEligible,
+    const newPlayer: Omit<Player, 'id'> = {
+      name: trimmedName, lastPlayed: null, eligibilityExpiresAt: null, status: Status.NotEligible,
     };
-    setPlayers(prev => [...prev, newPlayer]);
-    addHistoryEntry(trimmedName, 'added to the tracker');
-    setAddPlayerModalOpen(false);
+    try {
+        await addDoc(collection(db, 'players'), newPlayer);
+        await addHistoryEntry(trimmedName, 'added to the tracker');
+        setAddPlayerModalOpen(false);
+    } catch (error) {
+        console.error("Error adding player:", error);
+        setAddPlayerError('Failed to add player. Please try again.');
+    }
   };
 
   const handleResetAll = () => setConfirmationState({
     isOpen: true, title: 'Reset All Data', message: 'Are you sure you want to reset all player data? This cannot be undone.',
-    onConfirm: () => {
-      setPlayers([]);
-      setHistoryLog([]);
-      setConfirmationState({ ...confirmationState, isOpen: false });
-      addHistoryEntry('Admin', 'cleared all player data');
+    onConfirm: async () => {
+      const batch = writeBatch(db);
+      try {
+        const playersSnapshot = await getDocs(collection(db, 'players'));
+        playersSnapshot.forEach(doc => batch.delete(doc.ref));
+
+        const historySnapshot = await getDocs(collection(db, 'historyLog'));
+        historySnapshot.forEach(doc => batch.delete(doc.ref));
+        
+        await batch.commit();
+        await addHistoryEntry('Admin', 'cleared all player data');
+        setConfirmationState({ ...confirmationState, isOpen: false });
+      } catch (error) {
+        console.error("Error resetting all data:", error);
+      }
     },
   });
   
   const handleCleanupInactive = () => setConfirmationState({
     isOpen: true, title: 'Cleanup Inactive Players', message: 'Are you sure you want to permanently remove all inactive players?',
-    onConfirm: () => {
-      setPlayers(prev => prev.filter(p => p.status !== Status.Inactive));
-      setConfirmationState({ ...confirmationState, isOpen: false });
-      addHistoryEntry('Admin', 'cleaned up inactive players');
+    onConfirm: async () => {
+      const batch = writeBatch(db);
+      players.filter(p => p.status === Status.Inactive).forEach(player => {
+        batch.delete(doc(db, 'players', player.id));
+      });
+
+      try {
+        await batch.commit();
+        await addHistoryEntry('Admin', 'cleaned up inactive players');
+        setConfirmationState({ ...confirmationState, isOpen: false });
+      } catch (error) {
+        console.error("Error cleaning up inactive players:", error);
+      }
     },
   });
 
@@ -275,25 +270,22 @@ const App: React.FC = () => {
       title: 'Confirm Manual Override',
       message: `Are you sure you want to apply these changes to ${player.name}?`,
       confirmButtonClass: 'bg-sky-600 hover:bg-sky-500',
-      onConfirm: () => {
-        let playerName = '';
-        const updatedPlayers = players.map(p => {
-          if (p.id === playerId) {
-            playerName = p.name;
-            return {
-                ...p,
-                status: payload.status,
-                eligibilityExpiresAt: payload.eligibilityExpiresAt,
-                // If made not eligible, last played should not change, but if made eligible without expiry, clear it.
-                lastPlayed: payload.status === Status.NotEligible ? p.lastPlayed : new Date().toISOString(),
-            };
-          }
-          return p;
-        });
-        setPlayers(updatedPlayers);
-        addHistoryEntry(playerName, `status manually set to ${payload.status}`);
-        setPlayerToEdit(null);
-        setConfirmationState({ ...confirmationState, isOpen: false });
+      onConfirm: async () => {
+        const playerDocRef = doc(db, 'players', playerId);
+        const updatePayload = {
+            status: payload.status,
+            eligibilityExpiresAt: payload.eligibilityExpiresAt,
+            lastPlayed: payload.status === Status.NotEligible ? player.lastPlayed : new Date().toISOString(),
+        };
+
+        try {
+            await updateDoc(playerDocRef, updatePayload);
+            await addHistoryEntry(player.name, `status manually set to ${payload.status}`);
+            setPlayerToEdit(null);
+            setConfirmationState({ ...confirmationState, isOpen: false });
+        } catch(error) {
+            console.error("Error saving override:", error);
+        }
       },
     });
   };
